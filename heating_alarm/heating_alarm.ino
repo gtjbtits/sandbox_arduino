@@ -3,7 +3,7 @@
 #include <ESP8266WiFi.h>
 
 #define TIMER_INITIALIZATION 60
-#define TEMPERATURE_TRESHOLD 35
+#define TEMPERATURE_TRESHOLD 30
 #define SEND_STATS_EVERY_X_TICK 5
 
 #define STATE_INITIALIZATION 1
@@ -11,6 +11,32 @@
 #define STATE_ALARM 3
 #define STATE_DISARMED 4
 #define ABSOLUTE_ZERO_TEMP -273
+#define SERIAL_FREQUENCY 115200
+
+static const float ANALOG_RANGE_STEPS = 1024.0;
+
+static const uint8_t D0   = 16;
+static const uint8_t D1   = 5;
+static const uint8_t D2   = 4;
+static const uint8_t D3   = 0;
+static const uint8_t D4   = 2;
+static const uint8_t D5   = 14;
+static const uint8_t D6   = 12;
+static const uint8_t D7   = 13;
+static const uint8_t D8   = 15;
+
+/*
+ * ESP8266 Pinout: https://lastminuteengineers.com/esp8266-pinout-reference/
+ */
+static const uint8_t GPIO16 = D0; // HIGH at boot, used to wake up from deep sleep
+static const uint8_t GPIO5  = D1;
+static const uint8_t GPIO4  = D2;
+static const uint8_t GPIO0  = D3; // connected to FLASH button, boot fails if pulled LOW
+static const uint8_t GPIO2  = D4; // HIGH at boot, boot fails if pulled LOW
+static const uint8_t GPIO14 = D5;
+static const uint8_t GPIO12 = D6;
+static const uint8_t GPIO13 = D7;
+static const uint8_t GPIO15 = D8; // Required for boot, boot fails if pulled HIGH
 
 uint8_t symbolGrad[8] = {
   B00110,
@@ -55,15 +81,14 @@ const int port = 80;
 int state = STATE_INITIALIZATION;
 int lastNotifiedState = -1;
 int timer = 0;
-bool connected = false;
 int currentStatsTick = 0;
 
-int pinBeep = 0;
-int pinBtn = 15;
-int pinPotentiometer = A0;
+int pinBeep = GPIO0;
+// int pinFlameDetector = GPIO15;
+// int pinVoltmeter = A0;
 MicroDS18B20<2> sensor;
 
-LiquidCrystalRus lcd(16, 14, 12, 13, 5, 4); // (RS, E, DB4, DB5, DB6, DB7)
+LiquidCrystalRus lcd(GPIO16, GPIO14, GPIO12, GPIO13, GPIO5, GPIO4); // (RS, E, DB4, DB5, DB6, DB7)
 
 void playSuccessSound() {
   tone(pinBeep, 500);
@@ -74,6 +99,12 @@ void playSuccessSound() {
 void playErrorSound() {
   tone(pinBeep, 20);
   delay(200);
+  noTone(pinBeep);
+}
+
+void playAlarmSound() {
+  tone(pinBeep, 4000);
+  delay(1000);
   noTone(pinBeep);
 }
 
@@ -104,11 +135,9 @@ void changeState(int newState) {
 void onWiFiEvent(WiFiEvent_t event) {
   switch (event) {
     case WIFI_EVENT_STAMODE_DISCONNECTED:
-    connected = false;
       Serial.println("WiFi DISCONNECTED ssid(" + String(ssid) + ")");
       break;
     case WIFI_EVENT_STAMODE_GOT_IP:
-    connected = true;
       Serial.println("WiFi CONNECTED ssid(" + String(ssid) + ")");
       break;
     default:
@@ -131,69 +160,76 @@ void lcdSetup() {
   lcd.createChar(SYMBOL_OFFLINE_CODE, symbolOffline);
 }
 
-void httpGet(const String& url) {
+bool httpGet(const String& url) {
   WiFiClient client;
+  bool connected = WiFi.status() == WL_CONNECTED && client.connect(host, port);
 
-  if (WiFi.status() == WL_CONNECTED && client.connect(host, port)) {
+  if (connected) {
     client.print(String("GET ") + url + " HTTP/1.1\r\n" +
             "Host: " + host + "\r\n" +
             "Connection: close\r\n" +
             "\r\n");
     client.stop();
-  }  
+    return true;
+  }
+  return false;
 }
 
-void httpStats(int temp) {
+bool httpStats(int temp, bool lastConnectedState) {
   if (currentStatsTick == 0) {
     String url = "/ha/stats?t=";
     url += String(temp);
-    httpGet(url);
+    url += "&tl=";
+    url += String(TEMPERATURE_TRESHOLD);
+    return httpGet(url);
   }
   currentStatsTick = (currentStatsTick + 1) % SEND_STATS_EVERY_X_TICK;
+  return lastConnectedState;
 }
 
-void httpChangeState(int state) {
-  if (state != lastNotifiedState) {
-    String url = "/ha/state?s=";
-    url += String(state);
-    httpGet(url);
-    lastNotifiedState = state;
-  }
+bool httpChangeState(int state) {
+  String url = "/ha/state?s=";
+  url += String(state);
+  return httpGet(url);
 }
 
-void httpError(const String& msg) {
+bool httpError(const String& msg) {
     String url = "/ha/error?msg=";
     url += String(msg);
-    httpGet(url);  
+    return httpGet(url);  
 }
 
-char getWifiStatusSymbol() {
+char getConnectionStateSymbol(bool connected) {
   return connected ? char(SYMBOL_ONLINE_CODE) : char(SYMBOL_OFFLINE_CODE);
 }
 
 void setup() {
   timer = TIMER_INITIALIZATION;
-  Serial.begin(115200);
+  Serial.begin(SERIAL_FREQUENCY);
   delay(10);
   lcdSetup();
-  pinMode(pinBtn, INPUT);
   wifiSetup();
 }
 
 void loop() {
-  int stateBtn = digitalRead(pinBtn);
   int t = getCurrentTemperature();
-  httpChangeState(state);
-  lcd.clear();
+  bool connected = false;
+  if (state != lastNotifiedState) {
+    connected = httpChangeState(state);
+    lastNotifiedState = state;
+  }
 
   if (state == STATE_INITIALIZATION) {
     if (timer > 0) {
+      connected = httpStats(t, connected);
+
+      lcd.clear();
+      lcd.setCursor(0, 0);
       lcd.print("Подготовка: " + String(timer));
       lcd.setCursor(0, 1);
       lcd.print(sign(t) + String(t) + char(SYMBOL_GRAD_CODE));
       lcd.setCursor(13, 1);
-      lcd.print('(' + String(getWifiStatusSymbol()) + ')');
-      timer--;
+      lcd.print('(' + String(getConnectionStateSymbol(connected)) + ')');
 
       Serial.print("STATE_INITIALIZATION t=");
       Serial.print(t);
@@ -201,24 +237,28 @@ void loop() {
       Serial.print(TEMPERATURE_TRESHOLD);
       Serial.print(" timer=");
       Serial.println(timer);
+
+      timer--;
     } else {
       changeState(STATE_ARMED);
       playSuccessSound();
     }
   } else if (state == STATE_ARMED) {
     if (t > TEMPERATURE_TRESHOLD) {
+      connected = httpStats(t, connected);
+
+      lcd.clear();
+      lcd.setCursor(0, 0);
       lcd.print("В работе:");
       lcd.setCursor(0, 1);
       lcd.print(sign(t) + String(t) + char(SYMBOL_GRAD_CODE));
       lcd.setCursor(13, 1);
-      lcd.print('(' + String(getWifiStatusSymbol()) + ')');
+      lcd.print('(' + String(getConnectionStateSymbol(connected)) + ')');
 
       Serial.print("STATE_ARMED t=");
       Serial.print(t);
       Serial.print(" tl=");
-      Serial.print(TEMPERATURE_TRESHOLD);
-
-      httpStats(t);
+      Serial.println(TEMPERATURE_TRESHOLD);
     } else if (t != ABSOLUTE_ZERO_TEMP) {
       changeState(STATE_ALARM);
     } else {
@@ -227,39 +267,17 @@ void loop() {
       playErrorSound();
     }
   } else if (state == STATE_ALARM) {
+    lcd.clear();
     lcd.print("СРАБОТАЛА");
     lcd.setCursor(0, 1);
     lcd.print("СИГНАЛИЗАЦИЯ !!!");
-    tone(pinBeep, 4000);
-    delay(1000);
-    noTone(pinBeep);
+    playAlarmSound();
+    lcd.clear();
 
     Serial.print("STATE_ALARM t=");
     Serial.print(t);
-
-    if (stateBtn == HIGH) {
-      changeState(STATE_DISARMED);
-      playSuccessSound();
-      lcd.clear();
-      lcd.print("Отключение");
-      lcd.setCursor(0, 1);
-      lcd.print("сигнализации...");
-      delay(10000);
-      playSuccessSound();
-    }
-  } else if (state == STATE_DISARMED) {
-    lcd.print("Нажмите кнопку,");
-    lcd.setCursor(0, 1);
-    lcd.print("чтобы включить");
-
-    Serial.print("STATE_DISARMED t=");
-    Serial.print(t);
-
-    if (stateBtn == HIGH) {
-      timer = TIMER_INITIALIZATION;
-      changeState(STATE_INITIALIZATION);
-      playSuccessSound();
-    }
+    Serial.print(" tl=");
+    Serial.println(TEMPERATURE_TRESHOLD);
   } else {
     changeState(STATE_INITIALIZATION);
     playErrorSound();
